@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from app.pilots.repository import PilotRepository
 from app.core.clock import Clock, SystemClock, to_storage
-from app.core.errors import ConflictError, NotFoundError, ValidationError
+from app.core.errors import ConflictError, DomainError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
 
 
@@ -92,35 +92,46 @@ class PilotOperationsService:
             if candidate is None:
                 return None
             cursor = connection.execute(
-                "UPDATE pilot_sessions SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
+                "UPDATE pilot_sessions SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,lease_generation=lease_generation+1,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
                 (site_code, lease_until, now, now, candidate["id"]),
             )
             if cursor.rowcount != 1:
                 return None
             return dict(repository.session_by_id(candidate["id"]))
 
-    def heartbeat(self, session_id: int, site_code: str, lease_seconds: int) -> dict[str, Any]:
+    def heartbeat(self, session_id: int, site_code: str, lease_seconds: int, lease_generation: int) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
         expires = to_storage(now_value + timedelta(seconds=lease_seconds))
         with transaction(immediate=True) as connection:
+            repository = PilotRepository(connection)
+            # 续租只能发生在租约仍有效（lease_expires_at>=now）、持有者未变化且租约代次一致时；
+            # 过期后或恢复流程重新排队被再次领取后，旧请求（旧代次）无论重放多少次都不会命中。
             cursor = connection.execute(
-                "UPDATE pilot_sessions SET lease_expires_at=?,updated_at=?,version=version+1 WHERE id=? AND status='running' AND lease_owner=?",
-                (expires, now, session_id, site_code),
+                "UPDATE pilot_sessions SET lease_expires_at=?,updated_at=?,version=version+1 "
+                "WHERE id=? AND status='running' AND lease_owner=? AND lease_generation=? AND lease_expires_at<>'' AND lease_expires_at>=?",
+                (expires, now, session_id, site_code, lease_generation, now),
             )
             if cursor.rowcount != 1:
-                raise ConflictError("体验场次未由当前执行站点持有")
-            return dict(PilotRepository(connection).session_by_id(session_id))
+                raise self._reject_lease_action(repository, session_id, site_code, "heartbeat", now, lease_generation=lease_generation)
+            return dict(repository.session_by_id(session_id))
 
-    def complete(self, session_id: int, site_code: str, observation: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
-        now = to_storage(self.clock.now())
+    def complete(self, session_id: int, site_code: str, observation: dict[str, Any], metrics: dict[str, Any], lease_generation: int) -> dict[str, Any]:
+        now_value = self.clock.now()
+        now = to_storage(now_value)
         with transaction(immediate=True) as connection:
             repository = PilotRepository(connection)
             session = repository.session_by_id(session_id)
             if session is None:
                 raise NotFoundError("试点体验场次不存在")
             if session["status"] != "running" or session["lease_owner"] != site_code:
-                raise ConflictError("体验场次未由当前执行站点持有")
+                raise self._reject_lease_action(repository, session_id, site_code, "complete", now, session, lease_generation)
+            # 迟到的步态数据：旧租约代次的站点不得再写入观察版本，
+            # 否则会与恢复后新站点（新代次）的记录相互覆盖。
+            if int(session["lease_generation"]) != lease_generation:
+                raise self._reject_lease_action(repository, session_id, site_code, "complete", now, session, lease_generation)
+            if session["lease_expires_at"] == "" or session["lease_expires_at"] < now:
+                raise self._reject_lease_action(repository, session_id, site_code, "complete", now, session, lease_generation)
             version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM pilot_observations WHERE session_id=?", (session_id,)).fetchone()[0])
             connection.execute(
                 "INSERT INTO pilot_observations(session_id,version,observation_json,metrics_json,observation_digest,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -132,7 +143,7 @@ class PilotOperationsService:
             )
             return dict(repository.session_by_id(session_id))
 
-    def fail(self, session_id: int, site_code: str, error_code: str, message: str, retryable: bool) -> dict[str, Any]:
+    def fail(self, session_id: int, site_code: str, error_code: str, message: str, retryable: bool, lease_generation: int) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
         with transaction(immediate=True) as connection:
@@ -141,7 +152,12 @@ class PilotOperationsService:
             if session is None:
                 raise NotFoundError("试点体验场次不存在")
             if session["status"] != "running" or session["lease_owner"] != site_code:
-                raise ConflictError("体验场次未由当前执行站点持有")
+                raise self._reject_lease_action(repository, session_id, site_code, "fail", now, session, lease_generation)
+            # 与观察数据一致：旧租约代次或租约过期后，恢复流程拥有决定权，迟到的失败回执必须拒绝。
+            if int(session["lease_generation"]) != lease_generation:
+                raise self._reject_lease_action(repository, session_id, site_code, "fail", now, session, lease_generation)
+            if session["lease_expires_at"] == "" or session["lease_expires_at"] < now:
+                raise self._reject_lease_action(repository, session_id, site_code, "fail", now, session, lease_generation)
             can_retry = retryable and int(session["attempt_count"]) < int(session["max_attempts"])
             status = "queued" if can_retry else "failed"
             delay = min(300, 2 ** max(0, int(session["attempt_count"]) - 1)) if can_retry else 0
@@ -193,21 +209,36 @@ class PilotOperationsService:
         exhausted: list[int] = []
         with transaction(immediate=True) as connection:
             repository = PilotRepository(connection)
-            rows = connection.execute("SELECT * FROM pilot_sessions WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id", (now,)).fetchall()
-            for session in rows:
-                before = dict(session)
-                if int(session["attempt_count"]) < int(session["max_attempts"]):
-                    status, finished_at = "queued", None
-                    recovered.append(int(session["id"]))
+            rows = connection.execute(
+                "SELECT id FROM pilot_sessions WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id",
+                (now,),
+            ).fetchall()
+            for row in rows:
+                session_id = int(row["id"])
+                before_row = repository.session_by_id(session_id)
+                if before_row is None:
+                    continue
+                before = dict(before_row)
+                can_retry = int(before["attempt_count"]) < int(before["max_attempts"])
+                if can_retry:
+                    status, finished_at, target = "queued", None, recovered
                 else:
-                    status, finished_at = "failed", now
-                    exhausted.append(int(session["id"]))
-                connection.execute(
-                    "UPDATE pilot_sessions SET status=?,lease_owner='',lease_expires_at='',available_at=?,last_error_code='lease_expired',last_error_message='执行站点租约已过期',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
-                    (status, now, finished_at, now, session["id"]),
+                    status, finished_at, target = "failed", now, exhausted
+                # Fencing：只有状态仍为 running、持有者、租约代次与租约过期时间戳都与快照一致时才接管。
+                # 若并发的有效续租已延长租约（或该场次已被另一个恢复事务接管），rowcount 为 0，
+                # 本事务不做任何决定，也不追加干预记录，保证续租与恢复只有一个决定生效。
+                cursor = connection.execute(
+                    "UPDATE pilot_sessions SET status=?,lease_owner='',lease_expires_at='',available_at=?,"
+                    "last_error_code='lease_expired',last_error_message='执行站点租约已过期',finished_at=?,"
+                    "updated_at=?,version=version+1 "
+                    "WHERE id=? AND status='running' AND lease_owner=? AND lease_generation=? AND lease_expires_at=? AND lease_expires_at<>'' AND lease_expires_at<?",
+                    (status, now, finished_at, now, session_id, before["lease_owner"], before["lease_generation"], before["lease_expires_at"], now),
                 )
-                after = dict(repository.session_by_id(session["id"]))
-                repository.add_intervention(session_id=session["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
+                if cursor.rowcount != 1:
+                    continue
+                after = dict(repository.session_by_id(session_id))
+                repository.add_intervention(session_id=session_id, actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
+                target.append(session_id)
         return {"recovered": recovered, "exhausted": exhausted}
 
     def summary(self) -> dict[str, Any]:
@@ -227,6 +258,63 @@ class PilotOperationsService:
             after = dict(repository.session_by_id(session_id))
             repository.add_intervention(session_id=session_id, actor=actor, action=action, reason=reason, before=before, after=after, batch_key=batch_key, now=now)
             return after
+
+    @staticmethod
+    def _reject_lease_action(
+        repository: PilotRepository,
+        session_id: int,
+        site_code: str,
+        action: str,
+        now: str,
+        session: sqlite3.Row | None = None,
+        lease_generation: int | None = None,
+    ) -> DomainError:
+        """构造站点侧操作（续租/观察/失败回执）被拒绝时的错误，附带当前状态、持有者与租约代次。"""
+        action_labels = {"heartbeat": "续租", "complete": "提交观察结果", "fail": "上报失败回执"}
+        label = action_labels.get(action, action)
+        if session is None:
+            session = repository.session_by_id(session_id)
+        if session is None:
+            return NotFoundError("试点体验场次不存在")
+        status = str(session["status"])
+        owner = str(session["lease_owner"])
+        expires_at = str(session["lease_expires_at"])
+        current_generation = int(session["lease_generation"])
+        stale_generation = lease_generation is not None and lease_generation != current_generation
+        lease_expired = bool(expires_at) and expires_at < now
+        context: dict[str, Any] = {
+            "session_id": session_id,
+            "action": action,
+            "requested_by_site": site_code,
+            "current_status": status,
+            "lease_owner": owner or None,
+            "lease_expires_at": expires_at or None,
+            "lease_expired": lease_expired,
+            "current_lease_generation": current_generation,
+            "requested_lease_generation": lease_generation,
+            "stale_lease_generation": stale_generation,
+            "at": now,
+        }
+        if stale_generation:
+            holder = f"，当前持有者：{owner}" if owner else "，当前无执行站点"
+            return ConflictError(
+                f"站点{site_code}持有的是第{lease_generation}代租约，场次已进入第{current_generation}代租约{holder}，{label}被拒绝",
+                context=context,
+            )
+        if status != "running":
+            holder = f"，当前持有者：{owner}" if owner else "，当前无执行站点"
+            return ConflictError(f"体验场次当前状态为{status}{holder}，站点{site_code}的{label}请求被拒绝", context=context)
+        if owner != site_code:
+            return ConflictError(
+                f"体验场次由站点{owner}持有，站点{site_code}无权{label}（租约到期时间：{expires_at or '无'}）",
+                context=context,
+            )
+        if lease_expired:
+            return ConflictError(
+                f"站点{site_code}的租约已于{expires_at}过期，{label}被拒绝；过期后控制权只能由恢复流程接管，旧请求重放不会重新取得控制权",
+                context=context,
+            )
+        return ConflictError(f"站点{site_code}对体验场次的{label}请求被拒绝", context=context)
 
     @staticmethod
     def _cancel_mutation(connection: sqlite3.Connection, session: sqlite3.Row, now: str) -> None:

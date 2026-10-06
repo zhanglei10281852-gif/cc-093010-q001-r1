@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     available_at TEXT NOT NULL,
     lease_owner TEXT NOT NULL DEFAULT '',
     lease_expires_at TEXT NOT NULL DEFAULT '',
+    lease_generation INTEGER NOT NULL DEFAULT 0,
     current_observation_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
@@ -334,7 +335,11 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        # 既有试点数据库补齐租约代次列（fencing token），保留全部观察版本与人工干预记录。
+        session_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pilot_sessions)").fetchall()}
+        if "lease_generation" not in session_columns:
+            connection.execute("ALTER TABLE pilot_sessions ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0")
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

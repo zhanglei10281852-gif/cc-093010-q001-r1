@@ -38,10 +38,18 @@ class SessionClaim(BaseModel):
     lease_seconds: int = Field(default=60, ge=5, le=3600)
 
 
+class SessionHeartbeat(BaseModel):
+    site_code: str = Field(min_length=1, max_length=120)
+    lease_seconds: int = Field(default=60, ge=5, le=3600)
+    # 站点必须回显领取成功时获得的租约代次（fencing token）。
+    lease_generation: int = Field(ge=0)
+
+
 class SessionObservation(BaseModel):
     site_code: str = Field(min_length=1, max_length=120)
     observation: dict[str, Any]
     metrics: dict[str, Any] = Field(default_factory=dict)
+    lease_generation: int = Field(ge=0)
 
 
 class SessionFailure(BaseModel):
@@ -49,6 +57,7 @@ class SessionFailure(BaseModel):
     error_code: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=2000)
     retryable: bool = True
+    lease_generation: int = Field(ge=0)
 
 
 class CancelRequest(BaseModel):

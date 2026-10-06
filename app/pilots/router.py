@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Query
 
-from app.pilots.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, SessionClaim, SessionFailure, SessionObservation, SessionSubmit, ProtocolCreate
+from app.pilots.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, SessionClaim, SessionFailure, SessionHeartbeat, SessionObservation, SessionSubmit, ProtocolCreate
 from app.pilots.service import PilotOperationsService
 
 router = APIRouter(prefix="/api/pilots", tags=["健康创新试点体验场次运营"])
@@ -48,18 +48,18 @@ def claim_session(payload: SessionClaim):
 
 
 @router.post("/sessions/{session_id}/heartbeat")
-def heartbeat(session_id: int, payload: SessionClaim):
-    return service().heartbeat(session_id, payload.site_code, payload.lease_seconds)
+def heartbeat(session_id: int, payload: SessionHeartbeat):
+    return service().heartbeat(session_id, payload.site_code, payload.lease_seconds, payload.lease_generation)
 
 
 @router.post("/sessions/{session_id}/complete")
 def complete_session(session_id: int, payload: SessionObservation):
-    return service().complete(session_id, payload.site_code, payload.observation, payload.metrics)
+    return service().complete(session_id, payload.site_code, payload.observation, payload.metrics, payload.lease_generation)
 
 
 @router.post("/sessions/{session_id}/fail")
 def fail_session(session_id: int, payload: SessionFailure):
-    return service().fail(session_id, payload.site_code, payload.error_code, payload.message, payload.retryable)
+    return service().fail(session_id, payload.site_code, payload.error_code, payload.message, payload.retryable, payload.lease_generation)
 
 
 @router.post("/sessions/{session_id}/cancel")
